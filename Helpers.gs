@@ -134,37 +134,46 @@ function fetchSourceCalendars(sourceCalendarURLs){
     var colorId = source[1];
 
     try {
-      callWithBackoff(function() {
-        var urlResponse = UrlFetchApp.fetch(url, { 'validateHttpsCertificates' : false, 'muteHttpExceptions' : true });
-        if (urlResponse.getResponseCode() == 200){
-          var icsContent = urlResponse.getContentText()
-          const icsRegex = RegExp("(BEGIN:VCALENDAR.*?END:VCALENDAR)", "s")
-          var urlContent = icsRegex.exec(icsContent);
-          if (urlContent == null){
-            // Microsoft Outlook has a bug that sometimes results in incorrectly formatted ics files. This tries to fix that problem.
-            // Add END:VEVENT for every BEGIN:VEVENT that's missing it
-            const veventRegex = /BEGIN:VEVENT(?:(?!END:VEVENT).)*?(?=.BEGIN|.END:VCALENDAR|$)/sg;
-            icsContent = icsContent.replace(veventRegex, (match) => match + "\nEND:VEVENT");
-
-            // Add END:VCALENDAR if missing
-            if (!icsContent.endsWith("END:VCALENDAR")){
-                icsContent += "\nEND:VCALENDAR";
-            }
-            urlContent = icsRegex.exec(icsContent)
+      if (url == "ics_from_mail")
+      {
+        callWithBackoff(function() {
+          result.push([loadLatestEmailAttachment(), colorId]);
+        }, defaultMaxRetries);
+      }
+      else
+      {
+        callWithBackoff(function() {
+          var urlResponse = UrlFetchApp.fetch(url, { 'validateHttpsCertificates' : false, 'muteHttpExceptions' : true });
+          if (urlResponse.getResponseCode() == 200){
+            var icsContent = urlResponse.getContentText()
+            const icsRegex = RegExp("(BEGIN:VCALENDAR.*?END:VCALENDAR)", "s")
+            var urlContent = icsRegex.exec(icsContent);
             if (urlContent == null){
-              Logger.log("[ERROR] Incorrect ics/ical URL: " + url)
-              reportOverallFailure = true;
-              return
+              // Microsoft Outlook has a bug that sometimes results in incorrectly formatted ics files. This tries to fix that problem.
+              // Add END:VEVENT for every BEGIN:VEVENT that's missing it
+              const veventRegex = /BEGIN:VEVENT(?:(?!END:VEVENT).)*?(?=.BEGIN|.END:VCALENDAR|$)/sg;
+              icsContent = icsContent.replace(veventRegex, (match) => match + "\nEND:VEVENT");
+
+              // Add END:VCALENDAR if missing
+              if (!icsContent.endsWith("END:VCALENDAR")){
+                  icsContent += "\nEND:VCALENDAR";
+              }
+              urlContent = icsRegex.exec(icsContent)
+              if (urlContent == null){
+                Logger.log("[ERROR] Incorrect ics/ical URL: " + url)
+                reportOverallFailure = true;
+                return
+              }
+              Logger.log("[WARNING] Microsoft is incorrectly formatting ics/ical at: " + url)
             }
-            Logger.log("[WARNING] Microsoft is incorrectly formatting ics/ical at: " + url)
+            result.push([urlContent[0], colorId]);
+            return;
           }
-          result.push([urlContent[0], colorId]);
-          return;
-        }
-        else{ //Throw here to make callWithBackoff run again
-          throw "Error: Encountered HTTP error " + urlResponse.getResponseCode() + " when accessing " + url;
-        }
-      }, defaultMaxRetries);
+          else{ //Throw here to make callWithBackoff run again
+            throw "Error: Encountered HTTP error " + urlResponse.getResponseCode() + " when accessing " + url;
+          }
+        }, defaultMaxRetries);
+      }      
     }
     catch (e) {
       reportOverallFailure = true;
@@ -235,13 +244,17 @@ function parseResponses(responses){
   //No need to process cancelled events as they will be added to gcal's trash anyway
   result = result.filter(function(event){
     try{
-      return (event.getFirstPropertyValue('status').toString().toLowerCase() != "cancelled");
+      if (event.getFirstPropertyValue('status'))
+        return (event.getFirstPropertyValue('status').toString().toLowerCase() != "cancelled");
+      else return true;
     }catch(e){
       return true;
     }
   });
 
   result = filterResults(result);
+
+  result = propagateSummaries(result);
 
   result.forEach(function(event){
     if (!event.hasProperty('uid')){
@@ -271,6 +284,50 @@ function parseResponses(responses){
 
   return result;
 }
+
+/**
+ * Propagate SUMMARY across events with the same UID.
+ *
+ * @param {ICAL.Component[]} components - Array of ICAL.Component objects (e.g., VEVENT).
+ * @return {ICAL.Component[]} - The same array, with missing summaries filled in.
+ */
+function propagateSummaries(components) {
+  // Group components by UID
+  const grouped = {};
+  components.forEach(comp => {
+    const uid = comp.getFirstPropertyValue("uid");
+    if (!grouped[uid]) grouped[uid] = [];
+    grouped[uid].push(comp);
+  });
+
+  // For each UID group, propagate summary
+  Object.values(grouped).forEach(group => {
+    // Find a filled summary
+    const summarySource = group.find(c => {
+      const s = c.getFirstPropertyValue("summary");
+      return s && s.trim() !== "";
+    });
+    if (!summarySource) return; // no summary at all for this UID
+
+    const summaryText = summarySource.getFirstPropertyValue("summary");
+
+    var count=0;
+    // Fill missing summaries
+    group.forEach(c => {
+      const s = c.getFirstPropertyValue("summary");
+      if (!s || s.trim() === "") {
+        c.updatePropertyWithValue("summary", summaryText);
+        count++;
+      }
+    });
+    if (count > 0)
+      Logger.log("Filled in summary [" + summaryText + "] on " + count + " events.");
+  });
+
+  return components;
+}
+
+
 
 /**
  * Applies filters to source events based on filters defined in filters.gs
@@ -626,7 +683,7 @@ function processEvent(event, calendarTz){
     }
     else{
       if (addEventsToCalendar){
-        Logger.log("Adding new event " + newEvent.extendedProperties.private["id"]);
+        Logger.log("Adding new event " + newEvent.extendedProperties.private["id"] + "| Summary: " + newEvent.summary);
         try{
           newEvent = callWithBackoff(function(){
             return Calendar.Events.insert(newEvent, targetCalendarId);
@@ -864,7 +921,7 @@ function createEvent(event, calendarTz){
  * @param {Calendar.Event} recEvent - The event instance to process
  */
 function processEventInstance(recEvent){
-  Logger.log("ID: " + recEvent.extendedProperties.private["id"] + " | Date: "+ recEvent.recurringEventId);
+  Logger.log("ID: " + recEvent.extendedProperties.private["id"] + "| Date: "+ recEvent.recurringEventId);
 
   var eventInstanceToPatch = callWithBackoff(function(){
     return Calendar.Events.list(targetCalendarId,
@@ -895,7 +952,8 @@ function processEventInstance(recEvent){
 
   if (eventInstanceToPatch !== null && eventInstanceToPatch.length == 1){
     if (modifyExistingEvents){
-      Logger.log("Updating existing event instance");
+      Logger.log("Updating existing event instance: " + eventInstanceToPatch[0].displayName);
+      
       callWithBackoff(function(){
         Calendar.Events.update(recEvent, targetCalendarId, eventInstanceToPatch[0].id);
       }, defaultMaxRetries);
